@@ -1,0 +1,129 @@
+name: MEXT download bundle
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all linked files and rename from displayed titles
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, html, urllib.request, urllib.parse
+          from html.parser import HTMLParser
+          from pathlib import Path
+
+          PAGE = 'https://www.mext.go.jp/b_menu/shingi/kokuritu/gijiroku/1411366_00009.html'
+          OUT = Path('downloads')
+          OUT.mkdir(parents=True, exist_ok=True)
+          EXTS = {'.pdf','.xlsx','.xls','.docx','.doc','.pptx','.ppt','.zip','.csv','.txt','.rtf','.xml'}
+
+          class LinkParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links=[]
+                  self.cur=None
+                  self.text=[]
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == 'a':
+                      self.cur = dict(attrs).get('href')
+                      self.text=[]
+              def handle_data(self, data):
+                  if self.cur is not None:
+                      self.text.append(data)
+              def handle_endtag(self, tag):
+                  if tag.lower() == 'a' and self.cur is not None:
+                      self.links.append((self.cur, ''.join(self.text)))
+                      self.cur=None
+                      self.text=[]
+
+          def fetch(url):
+              req=urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0 (compatible; document-downloader/1.0)'})
+              return urllib.request.urlopen(req, timeout=60)
+
+          with fetch(PAGE) as r:
+              raw=r.read()
+              ctype=r.headers.get_content_charset() or 'utf-8'
+          try:
+              page=raw.decode(ctype)
+          except UnicodeDecodeError:
+              page=raw.decode('utf-8','replace')
+
+          p=LinkParser(); p.feed(page)
+          candidates=[]; seen=set()
+          for href, label in p.links:
+              if not href: continue
+              url=urllib.parse.urljoin(PAGE, html.unescape(href))
+              parsed=urllib.parse.urlparse(url)
+              ext=Path(parsed.path).suffix.lower()
+              if parsed.netloc.endswith('mext.go.jp') and (ext in EXTS or '/__icsFiles/' in parsed.path):
+                  if url in seen: continue
+                  seen.add(url)
+                  title=re.sub(r'\s+',' ', html.unescape(label)).strip()
+                  if not title:
+                      title=Path(parsed.path).stem
+                  candidates.append((url,title))
+
+          print(f'Found {len(candidates)} unique downloadable links')
+          if len(candidates) != 30:
+              print('Downloadable link titles found:')
+              for i,(u,t) in enumerate(candidates,1): print(i, t, u)
+              raise SystemExit(f'Expected 30 files, found {len(candidates)}; refusing to create an incomplete/incorrect bundle.')
+
+          invalid_map=str.maketrans({'/':'／','\\':'＼',':':'：','*':'＊','?':'？','"':'”','<':'＜','>':'＞','|':'｜'})
+          used=set()
+          def clean_title(title):
+              # File-size/type annotation is page metadata, not the document title.
+              title=re.sub(r'\s*[（(]\s*(?:PDF|Excel|Word|PowerPoint|ZIP|CSV)\s*[：:]\s*[^）)]*[）)]\s*$', '', title, flags=re.I)
+              title=re.sub(r'\s+',' ',title).strip().translate(invalid_map).rstrip(' .')
+              return title or '資料'
+
+          downloaded=[]
+          for idx,(url,title) in enumerate(candidates,1):
+              parsed=urllib.parse.urlparse(url)
+              ext=Path(parsed.path).suffix.lower()
+              try:
+                  with fetch(url) as r:
+                      data=r.read()
+                      if not ext:
+                          ct=(r.headers.get_content_type() or '').lower()
+                          ext={
+                              'application/pdf':'.pdf',
+                              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'.xlsx',
+                              'application/vnd.ms-excel':'.xls',
+                              'application/vnd.openxmlformats-officedocument.wordprocessingml.document':'.docx',
+                              'application/msword':'.doc',
+                              'application/vnd.openxmlformats-officedocument.presentationml.presentation':'.pptx',
+                              'application/vnd.ms-powerpoint':'.ppt',
+                              'application/zip':'.zip',
+                          }.get(ct,'')
+              except Exception as e:
+                  raise SystemExit(f'Failed to download {url}: {e}')
+              base=clean_title(title)
+              # Avoid duplicating the extension if the visible title already contains it.
+              filename=base if ext and base.lower().endswith(ext) else base+ext
+              stem=Path(filename).stem; suffix=Path(filename).suffix
+              n=2
+              while filename.casefold() in used:
+                  filename=f'{stem}（{n}）{suffix}'; n+=1
+              used.add(filename.casefold())
+              path=OUT/filename
+              path.write_bytes(data)
+              downloaded.append(path)
+              print(f'[{idx:02d}/30] {filename} ({len(data):,} bytes)')
+
+          if len(downloaded) != 30 or any(p.stat().st_size == 0 for p in downloaded):
+              raise SystemExit('Validation failed; refusing to upload incomplete bundle.')
+          print('Validated 30/30 files.')
+          PY
+      - name: Upload renamed files as ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MEXT_kokuritu_1411366_00009
+          path: downloads/*
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 1
